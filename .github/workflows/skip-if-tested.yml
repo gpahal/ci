@@ -1,0 +1,57 @@
+name: Skip if tested
+
+# Call it as the first job of a check workflow. On a push, it outputs tested=true when a passing
+# run of the same workflow already tested exactly these files on the merged PR's head. Any doubt
+# or API error outputs tested=false, so the checks run.
+on:
+  workflow_call:
+    outputs:
+      tested:
+        description: "'true' when the calling workflow can skip its checks."
+        value: ${{ jobs.gate.outputs.tested }}
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      tested: ${{ steps.gate.outputs.tested }}
+    steps:
+      - id: gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          api() { gh api "repos/$GITHUB_REPOSITORY/$1" --jq "$2"; }
+          tested=false
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            # GitHub can take a few seconds to link a new merge commit to its PR.
+            for try in 1 2 3; do
+              head="$(api "commits/$GITHUB_SHA/pulls" '[.[] | select(.merged_at)][0].head.sha // empty')" || head=
+              [ -z "$head" ] || break
+              [ "$try" = 3 ] || sleep 5
+            done
+            # The caller's workflow file, such as check.yml, from owner/repo/.github/workflows/check.yml@ref.
+            workflow="${WORKFLOW_REF%@*}"
+            workflow="${workflow##*/}"
+            # 1. main before this push is in the PR branch, so every PR run tested the head's own files.
+            # 2. The head has the same files as the pushed commit.
+            # 3. A run of this workflow passed on the head.
+            if [ -n "$head" ] &&
+                [ "$(api "compare/$BEFORE...$head" '.status == "ahead" or .status == "identical"')" = true ] &&
+                head_tree="$(api "git/commits/$head" .tree.sha)" && [ -n "$head_tree" ] &&
+                [ "$(api "git/commits/$GITHUB_SHA" .tree.sha)" = "$head_tree" ] &&
+                [ "$(api "actions/workflows/$workflow/runs?head_sha=$head&status=success&per_page=1" '.total_count > 0')" = true ]; then
+              tested=true
+              echo "A passing $workflow run on PR head $head tested these files; skipping the checks."
+            else
+              echo "No passing PR run tested these files; running the checks."
+            fi
+          fi
+          echo "tested=$tested" >> "$GITHUB_OUTPUT"

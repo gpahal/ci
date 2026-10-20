@@ -1,0 +1,27 @@
+name: Self-test
+
+# A PR merged while main hasn't moved should show work as skipped on main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    uses: ./.github/workflows/skip-if-tested.yml
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+
+  work:
+    needs: gate
+    if: needs.gate.outputs.tested != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          TESTED: ${{ needs.gate.outputs.tested }}
+        run: test "$TESTED" = false
