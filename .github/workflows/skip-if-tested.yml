@@ -1,8 +1,8 @@
 name: Skip if tested
 
 # Call it as the first job of a check workflow. On a push, it outputs tested=true when a passing
-# run of the same workflow already tested exactly these files on the merged PR's head. Any doubt
-# or API error outputs tested=false, so the checks run.
+# pull_request run of the same workflow already tested exactly these files on the merged PR's head.
+# Any doubt or API error outputs tested=false, so the checks run.
 on:
   workflow_call:
     outputs:
@@ -28,28 +28,73 @@ jobs:
           BEFORE: ${{ github.event.before }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
-          api() { gh api "repos/$GITHUB_REPOSITORY/$1" --jq "$2"; }
-          tested=false
-          if [ "$GITHUB_EVENT_NAME" = push ]; then
+          # GET with -f sends URL-encoded query parameters. API values reach jq only through --arg.
+          api() { gh api -X GET "repos/$GITHUB_REPOSITORY/$1" "${@:2}"; }
+
+          # Succeeds only when a passing PR run tested the pushed commit's files. Called in an
+          # `if`, so `-e` is off here and every check returns explicitly.
+          tested_on_head() {
+            local try pr head branch repo owner head_tree prs since number changed workflow
             # GitHub can take a few seconds to link a new merge commit to its PR.
             for try in 1 2 3; do
-              head="$(api "commits/$GITHUB_SHA/pulls" '[.[] | select(.merged_at)][0].head.sha // empty')" || head=
-              [ -z "$head" ] || break
+              pr="$(api "commits/$GITHUB_SHA/pulls" |
+                jq -c --arg ref "$GITHUB_REF_NAME" \
+                  '[.[] | select(.merged_at and .base.ref == $ref)][0] // empty')" || pr=
+              [ -z "$pr" ] || break
               [ "$try" = 3 ] || sleep 5
             done
-            # The caller's workflow file, such as check.yml, from owner/repo/.github/workflows/check.yml@ref.
+            [ -n "$pr" ] || return 1
+            head="$(jq -r '.head.sha // empty' <<<"$pr")"
+            branch="$(jq -r '.head.ref // empty' <<<"$pr")"
+            # Empty when the PR's fork was deleted
+            repo="$(jq -r '.head.repo.full_name // empty' <<<"$pr")"
+            owner="$(jq -r '.head.repo.owner.login // empty' <<<"$pr")"
+            [ -n "$head" ] && [ -n "$branch" ] && [ -n "$repo" ] && [ -n "$owner" ] || return 1
+
+            # 1. The branch before this push is in the PR head. Unless the branch was rewound,
+            #    so are its earlier states, which PR runs merged the head with, so every PR run
+            #    tested the head's own files.
+            [ "$(api "compare/$BEFORE...$head" |
+              jq '.status == "ahead" or .status == "identical"')" = true ] || return 1
+
+            # 2. The head has the same files as the pushed commit.
+            head_tree="$(api "git/commits/$head" | jq -r '.tree.sha // empty')"
+            [ -n "$head_tree" ] &&
+              [ "$(api "git/commits/$GITHUB_SHA" | jq -r '.tree.sha // empty')" = "$head_tree" ] ||
+              return 1
+
+            # 3. Every PR from the head's branch targets this branch, so no run on the head merged
+            #    it into another one. Editing a PR's base doesn't trigger a run, so a run counts
+            #    only if it started after the last base change.
+            prs="$(api pulls -f state=all -f head="$owner:$branch" -f per_page=100)" || return 1
+            [ "$(jq --arg ref "$GITHUB_REF_NAME" \
+              'length > 0 and length < 100 and all(.base.ref == $ref)' <<<"$prs")" = true ] ||
+              return 1
+            since=
+            for number in $(jq '.[].number' <<<"$prs"); do
+              changed="$(api "issues/$number/events" --paginate \
+                --jq '.[] | select(.event == "base_ref_changed") | .created_at')" || return 1
+              since="$(printf '%s\n%s\n' "$since" "$changed" | sort | tail -n 1)"
+            done
+
+            # 4. A pull_request run of this workflow from the head's branch passed on the head.
+            #    The caller's workflow file, such as check.yml, comes from
+            #    owner/repo/.github/workflows/check.yml@ref.
             workflow="${WORKFLOW_REF%@*}"
             workflow="${workflow##*/}"
-            # 1. main before this push is in the PR branch, so every PR run tested the head's own files.
-            # 2. The head has the same files as the pushed commit.
-            # 3. A run of this workflow passed on the head.
-            if [ -n "$head" ] &&
-                [ "$(api "compare/$BEFORE...$head" '.status == "ahead" or .status == "identical"')" = true ] &&
-                head_tree="$(api "git/commits/$head" .tree.sha)" && [ -n "$head_tree" ] &&
-                [ "$(api "git/commits/$GITHUB_SHA" .tree.sha)" = "$head_tree" ] &&
-                [ "$(api "actions/workflows/$workflow/runs?head_sha=$head&status=success&per_page=1" '.total_count > 0')" = true ]; then
+            [ "$(api "actions/workflows/$workflow/runs" -f head_sha="$head" \
+              -f event=pull_request -f status=success -f per_page=100 |
+              jq --arg branch "$branch" --arg repo "$repo" --arg since "$since" \
+                'any(.workflow_runs[]; .head_branch == $branch and
+                  .head_repository.full_name == $repo and .run_started_at > $since)')" = true ] ||
+              return 1
+            echo "A passing $workflow run on PR head $head tested these files; skipping the checks."
+          }
+
+          tested=false
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            if tested_on_head; then
               tested=true
-              echo "A passing $workflow run on PR head $head tested these files; skipping the checks."
             else
               echo "No passing PR run tested these files; running the checks."
             fi
