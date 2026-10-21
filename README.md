@@ -6,10 +6,13 @@ PR already passed it on the same files.
 A repo runs its checks on every pull request and on every push to `main`. After a squash merge,
 `skip-if-tested.yml` outputs `tested=true` only when all of these hold:
 
-1. The pushed commit belongs to a merged PR.
+1. The pushed commit belongs to a PR merged into the pushed branch.
 2. `main` before the push is an ancestor of the PR head, so the PR branch was up to date.
 3. The PR head has the same tree (the same files) as the pushed commit.
-4. A run of the same workflow file passed on the PR head.
+4. Every PR from the head's branch targets the pushed branch, so no run merged the head into
+   another one.
+5. A `pull_request` run of the same workflow file, from the PR's head branch and repo, passed on
+   the PR head after the last change of any such PR's base.
 
 Otherwise, including on any API error, it outputs `tested=false` and the checks run. When
 `main` moved after a PR's run, the merge lands files no run tested, so the checks run.
@@ -27,7 +30,7 @@ permissions:
 
 jobs:
   gate:
-    uses: gpahal/ci/.github/workflows/skip-if-tested.yml@<commit-sha> # v1.0.0
+    uses: gpahal/ci/.github/workflows/skip-if-tested.yml@<commit-sha> # v1.1.0
     permissions:
       actions: read
       contents: read
@@ -50,6 +53,8 @@ tag in a comment.
   `if: ${{ !cancelled() && !failure() }}`.
 - The whole PR run must pass. If any job failed, even one that isn't a required check, the push
   run runs everything.
+- Protect `main` against force-pushes. A PR run tests the head merged into `main` as it was then,
+  and only a `main` that moves forward keeps that state in the head.
 - On pull requests the gate always outputs `false`, so required checks are unaffected. The PR
   shows the gate as `gate / gate`.
 
