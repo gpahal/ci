@@ -30,7 +30,7 @@ permissions:
 
 jobs:
   gate:
-    uses: gpahal/ci/.github/workflows/skip-if-tested.yml@<commit-sha> # v1.1.0
+    uses: gpahal/ci/.github/workflows/skip-if-tested.yml@ee5b876c99dc4af15f288630704e48421a637716 # v1.1.0
     permissions:
       actions: read
       contents: read
